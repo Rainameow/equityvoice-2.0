@@ -1,4 +1,5 @@
 
+import threading
 import json
 import os
 import re
@@ -670,14 +671,64 @@ def confirm(pid: str):
 # ==========================================
 # DATABASE HELPER
 # ==========================================
+# ==========================================
+# AUTOMATIC DEMO DATABASE RECOVERY
+# ==========================================
+
+DEMO_CSV = Path(__file__).resolve().parent / "datasets" / "03_racial_gap.csv"
+_demo_db_lock = threading.Lock()
+
+
+def ensure_demo_database():
+    """Rebuild the synthetic demo payroll if Render's ephemeral database disappears."""
+    if DB_PATH.exists():
+        return
+
+    with _demo_db_lock:
+        if DB_PATH.exists():
+            return
+
+        if not DEMO_CSV.exists():
+            raise HTTPException(503, "Demo payroll dataset is unavailable.")
+
+        temp_path = None
+        try:
+            raw = load_raw(DEMO_CSV.read_bytes(), DEMO_CSV.name)
+            mapping = get_mapping(raw)
+            table = extract(raw, mapping)
+            norm = get_norm(table, mapping)
+            records, errors = build_records(table, mapping, norm)
+
+            total = len(records) + len(errors)
+            if not records or (total and len(errors) / total > 0.05):
+                raise ValueError(
+                    f"Demo CSV validation failed: {len(errors)} rejected rows."
+                )
+
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", encoding="utf-8", delete=False
+            ) as temp_file:
+                json.dump(records, temp_file)
+                temp_path = temp_file.name
+
+            build_db.main(temp_path)
+        except Exception as error:
+            raise HTTPException(
+                503, f"Could not initialize demo payroll database: {error}"
+            ) from error
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+        if not DB_PATH.exists():
+            raise HTTPException(
+                503, "Demo payroll database initialization did not create the database."
+            )
+
 
 def get_connection():
 
-    if not DB_PATH.exists():
-        raise HTTPException(
-            404,
-            "No payroll database loaded yet."
-        )
+    ensure_demo_database()
 
     try:
         return sqlite3.connect(
@@ -690,7 +741,6 @@ def get_connection():
             500,
             "Could not connect to payroll database."
         )
-
 
 def get_payroll_rows():
     connection = get_connection()
